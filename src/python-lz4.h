@@ -31,8 +31,8 @@
 
 #include "Python.h"
 
-static PyObject *py_lz4_compress(PyObject *self, PyObject *args);
-static PyObject *py_lz4_uncompress(PyObject *self, PyObject *args);
+static PyObject *py_lz4_compress(PyObject *self, PyObject *args, PyObject * keywds);
+static PyObject *py_lz4_uncompress(PyObject *self, PyObject *args, PyObject * keywds);
 
 PyMODINIT_FUNC initlz4(void);
 

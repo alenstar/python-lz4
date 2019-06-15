@@ -39,6 +39,15 @@
 
 #define MAX(a, b)               ((a) > (b) ? (a) : (b))
 
+#if PY_MAJOR_VERSION >= 3
+/***** Python 3 *****/
+#define IS_PY3 1
+#else
+/***** Python 2 *****/
+#define IS_PY3 0
+#endif
+
+
 typedef int (*compressor)(const char *source, char *dest, int isize);
 
 static inline void store_le32(char *c, uint32_t x) {
@@ -53,27 +62,166 @@ static inline uint32_t load_le32(const char *c) {
     return d[0] | (d[1] << 8) | (d[2] << 16) | (d[3] << 24);
 }
 
-static const int hdr_size = sizeof(uint32_t);
+static inline void store_be32(char *c, uint32_t x) {
+    c[3] = x & 0xff;
+    c[2] = (x >> 8) & 0xff;
+    c[1] = (x >> 16) & 0xff;
+    c[0] = (x >> 24) & 0xff;
+}
 
-static PyObject *compress_with(compressor compress, PyObject *self, PyObject *args) {
-    PyObject *result;
-    const char *source;
-    int source_size;
-    char *dest;
-    int dest_size;
+static inline uint32_t load_be32(const char *c) {
+    const uint8_t *d = (const uint8_t *)c;
+    return d[3] | (d[2] << 8) | (d[1] << 16) | (d[0] << 24);
+}
 
-    if (!PyArg_ParseTuple(args, "s#", &source, &source_size))
+
+inline const char* VarintParse32WithLimit(const char* p,
+                                            const char* l,
+                                            uint32_t* OUTPUT) {
+    const unsigned char* ptr = (const unsigned char*)(p);
+    const unsigned char* limit = (const unsigned char*)(l);
+    uint32_t b, result;
+    if (ptr >= limit) return NULL;
+    b = *(ptr++); result = b & 127;          if (b < 128) goto done;
+    if (ptr >= limit) return NULL;
+    b = *(ptr++); result |= (b & 127) <<  7; if (b < 128) goto done;
+    if (ptr >= limit) return NULL;
+    b = *(ptr++); result |= (b & 127) << 14; if (b < 128) goto done;
+    if (ptr >= limit) return NULL;
+    b = *(ptr++); result |= (b & 127) << 21; if (b < 128) goto done;
+    if (ptr >= limit) return NULL;
+    b = *(ptr++); result |= (b & 127) << 28; if (b < 16) goto done;
+    return NULL;       // Value is too long to be a varint32
+done:
+    *OUTPUT = result;
+    return (const char*)(ptr);
+}
+
+inline char* VarintEncode32(char* sptr, uint32_t v) {
+    // Operate on characters as unsigneds
+    unsigned char* ptr = (unsigned char*)(sptr);
+    static const int B = 128;
+    if (v < (1<<7)) {
+        *(ptr++) = v;
+    } else if (v < (1<<14)) {
+        *(ptr++) = v | B;
+        *(ptr++) = v>>7;
+    } else if (v < (1<<21)) {
+        *(ptr++) = v | B;
+        *(ptr++) = (v>>7) | B;
+        *(ptr++) = v>>14;
+    } else if (v < (1<<28)) {
+        *(ptr++) = v | B;
+        *(ptr++) = (v>>7) | B;
+        *(ptr++) = (v>>14) | B;
+        *(ptr++) = v>>21;
+    } else {
+        *(ptr++) = v | B;
+        *(ptr++) = (v>>7) | B;
+        *(ptr++) = (v>>14) | B;
+        *(ptr++) = (v>>21) | B;
+        *(ptr++) = v>>28;
+    }
+    return (char*)(ptr);
+}
+
+
+//static const int hdr_size = sizeof(uint32_t);
+
+static PyObject *compress_with(compressor compress, PyObject *self, PyObject *args, PyObject * keywds) {
+    PyObject *result = NULL;
+    char *dest = NULL;
+    int dest_size = 0;
+
+    Py_buffer source;
+    int head_type = 1; // le32
+    int return_bytearray = 0;
+    int hdr_size = sizeof(uint32_t);
+
+    static char *kwlist[] = { "data", 
+                            "head_type", // 0:none 1:le32 2:be32 3:varint
+                            "return_bytearray",
+                            NULL
+                          };
+
+#if IS_PY3
+    if (!PyArg_ParseTupleAndKeywords (args, keywds, "s*|ii", kwlist,
+                                    &source,
+                                    &head_type,
+                                    &return_bytearray))
+    {
+      return NULL;
+    }
+#else
+  if (!PyArg_ParseTupleAndKeywords (args, keywds, "s*|ii", kwlist,
+                                    &source,
+                                    &head_type,
+                                    &return_bytearray))
+    {
+      return NULL;
+    }
+#endif
+    if (source.len == 0) {
         return NULL;
+    }
 
-    dest_size = hdr_size + LZ4_compressBound(source_size);
+    switch (head_type) {
+    // none
+    case 0:
+        hdr_size = 0;
+        break;
+    // varint
+    case 3: {
+        char buf[8] = {0};
+        char* p = VarintEncode32(buf, source.len);
+        hdr_size = p - buf;
+        }
+        break;
+    // le32
+    case 1:
+    // be32
+    case 2:
+    // le32
+    default:
+        hdr_size = sizeof(uint32_t);
+        break;
+    }
+
+    dest_size = hdr_size + LZ4_compressBound(source.len);
     result = PyBytes_FromStringAndSize(NULL, dest_size);
     if (result == NULL) {
         return NULL;
     }
     dest = PyBytes_AS_STRING(result);
-    store_le32(dest, source_size);
-    if (source_size > 0) {
-        int osize = compress(source, dest + hdr_size, source_size);
+
+    switch (head_type) {
+    // none
+    case 0: 
+        break;
+    // varint
+    case 3: 
+        VarintEncode32(dest, source.len);
+        break;
+    // le32
+    case 1:
+        store_le32(dest, source.len);
+        break;
+    // be32
+    case 2:
+        store_be32(dest, source.len);
+        break;
+    // le32
+    default:
+        store_le32(dest, source.len);
+        break;
+    }
+
+
+    if (source.len > 0) {
+        int osize = 0;
+        Py_BEGIN_ALLOW_THREADS
+        osize = compress(source.buf, dest + hdr_size, source.len);
+        Py_END_ALLOW_THREADS
         int actual_size = hdr_size + osize;
         /* Resizes are expensive; tolerate some slop to avoid. */
         if (actual_size < (dest_size / 4) * 3) {
@@ -85,40 +233,129 @@ static PyObject *compress_with(compressor compress, PyObject *self, PyObject *ar
     return result;
 }
 
-static PyObject *py_lz4_compress(PyObject *self, PyObject *args) {
-    return compress_with(LZ4_compress, self, args);
+static PyObject *py_lz4_compress(PyObject *self, PyObject *args, PyObject * keywds) {
+    return compress_with(LZ4_compress, self, args, keywds);
 }
 
-static PyObject *py_lz4_compressHC(PyObject *self, PyObject *args) {
-    return compress_with(LZ4_compressHC, self, args);
+static PyObject *py_lz4_compressHC(PyObject *self, PyObject *args, PyObject * keywds) {
+    return compress_with(LZ4_compressHC, self, args, keywds);
 }
 
-static PyObject *py_lz4_uncompress(PyObject *self, PyObject *args) {
-    PyObject *result;
-    const char *source;
-    int source_size;
-    uint32_t dest_size;
+static PyObject *py_lz4_uncompress(PyObject *self, PyObject *args, PyObject * keywds) {
+    PyObject *result = NULL;
+    uint32_t dest_size = 0;
 
-    if (!PyArg_ParseTuple(args, "s#", &source, &source_size)) {
-        return NULL;
+    Py_buffer source;
+    int head_type = 1; // le32
+    int return_bytearray = 0;
+    int max_size = 0;
+    int hdr_size = sizeof(uint32_t);
+
+    static char *kwlist[] = { "data", 
+                            "head_type", // 0:none 1:le32 2:be32 3:varint
+                            "max_size",
+                            "return_bytearray",
+                            NULL
+                          };
+
+#if IS_PY3
+    if (!PyArg_ParseTupleAndKeywords (args, keywds, "y*|iii", kwlist,
+                                    &source,
+                                    &head_type,
+                                    &max_size,
+                                    &return_bytearray))
+    {
+      return NULL;
+    }
+#else
+  if (!PyArg_ParseTupleAndKeywords (args, keywds, "s*|iii", kwlist,
+                                    &source,
+                                    &head_type,
+                                    &max_size,
+                                    &return_bytearray))
+    {
+      return NULL;
+    }
+#endif
+
+    switch (head_type) {
+    // none
+    case 0:
+        hdr_size = 0;
+        dest_size = source.len;
+        break;
+    // le32
+    case 1:
+        hdr_size = sizeof(uint32_t);
+        dest_size = load_le32(source.buf);
+        break;
+    // be32
+    case 2:
+        hdr_size = sizeof(uint32_t);
+        dest_size = load_be32(source.buf);
+        break;
+    // varint
+    case 3:
+        hdr_size = VarintParse32WithLimit(source.buf, source.buf + (sizeof(uint32_t)+1), &dest_size) - (const char*)(source.buf);
+        break;
+    // le32
+    default:
+        hdr_size = sizeof(uint32_t);
+        dest_size = load_le32(source.buf);
+        break;
     }
 
-    if (source_size < hdr_size) {
+    if (source.len < hdr_size) {
         PyErr_SetString(PyExc_ValueError, "input too short");
         return NULL;
     }
-    dest_size = load_le32(source);
+
     if (dest_size > INT_MAX) {
         PyErr_Format(PyExc_ValueError, "invalid size in header: 0x%x", dest_size);
         return NULL;
     }
+    if (hdr_size == 0) {
+        if (max_size ==0 ){
+            dest_size = (dest_size < 1024 * 16) ? dest_size * 16: dest_size * 32;
+        } else {
+            dest_size = max_size;            
+        }
+    }
     result = PyBytes_FromStringAndSize(NULL, dest_size);
     if (result != NULL && dest_size > 0) {
         char *dest = PyBytes_AS_STRING(result);
-        int osize = LZ4_decompress_safe(source + hdr_size, dest, source_size - hdr_size, dest_size);
+        int osize = 0;
+        Py_BEGIN_ALLOW_THREADS
+        osize = LZ4_decompress_safe(source.buf + hdr_size, dest, source.len - hdr_size, dest_size);
+        Py_END_ALLOW_THREADS
         if (osize < 0) {
+            if (hdr_size == 0) {
+                int rc  = _PyBytes_Resize(&result, dest_size * 2);
+                if (rc != 0) {
+                    return result;
+                }
+                dest_size = dest_size * 2;
+                Py_BEGIN_ALLOW_THREADS
+                osize = LZ4_decompress_safe(source.buf + hdr_size, dest, source.len - hdr_size, dest_size);
+                Py_END_ALLOW_THREADS
+                if (osize >= 0) {
+                    if (osize < (dest_size/ 4) * 3) {
+                        _PyBytes_Resize(&result, osize);
+                    } else {
+                        Py_SIZE(result) = osize;
+                    }
+                }
+            }
+
             PyErr_Format(PyExc_ValueError, "corrupt input at byte %d", -osize);
             Py_CLEAR(result);
+        }
+        else if (hdr_size == 0) {
+            if (osize < (dest_size/ 4) * 3) {
+                _PyBytes_Resize(&result, osize);
+            } else {
+                Py_SIZE(result) = osize;
+            }
         }
     }
 
@@ -126,14 +363,14 @@ static PyObject *py_lz4_uncompress(PyObject *self, PyObject *args) {
 }
 
 static PyMethodDef Lz4Methods[] = {
-    {"LZ4_compress",  py_lz4_compress, METH_VARARGS, COMPRESS_DOCSTRING},
-    {"LZ4_uncompress",  py_lz4_uncompress, METH_VARARGS, UNCOMPRESS_DOCSTRING},
-    {"compress",  py_lz4_compress, METH_VARARGS, COMPRESS_DOCSTRING},
-    {"compressHC",  py_lz4_compressHC, METH_VARARGS, COMPRESSHC_DOCSTRING},
-    {"uncompress",  py_lz4_uncompress, METH_VARARGS, UNCOMPRESS_DOCSTRING},
-    {"decompress",  py_lz4_uncompress, METH_VARARGS, UNCOMPRESS_DOCSTRING},
-    {"dumps",  py_lz4_compress, METH_VARARGS, COMPRESS_DOCSTRING},
-    {"loads",  py_lz4_uncompress, METH_VARARGS, UNCOMPRESS_DOCSTRING},
+    {"LZ4_compress",  py_lz4_compress, METH_VARARGS|METH_KEYWORDS, COMPRESS_DOCSTRING},
+    {"LZ4_uncompress",  py_lz4_uncompress, METH_VARARGS|METH_KEYWORDS, UNCOMPRESS_DOCSTRING},
+    {"compress",  py_lz4_compress, METH_VARARGS|METH_KEYWORDS, COMPRESS_DOCSTRING},
+    {"compressHC",  py_lz4_compressHC, METH_VARARGS|METH_KEYWORDS, COMPRESSHC_DOCSTRING},
+    {"uncompress",  py_lz4_uncompress, METH_VARARGS|METH_KEYWORDS, UNCOMPRESS_DOCSTRING},
+    {"decompress",  py_lz4_uncompress, METH_VARARGS|METH_KEYWORDS, UNCOMPRESS_DOCSTRING},
+    {"dumps",  py_lz4_compress, METH_VARARGS|METH_KEYWORDS, COMPRESS_DOCSTRING},
+    {"loads",  py_lz4_uncompress, METH_VARARGS|METH_KEYWORDS, UNCOMPRESS_DOCSTRING},
     {NULL, NULL, 0, NULL}
 };
 

@@ -22,10 +22,13 @@ Usage
 The library is pretty simple to use::
 
     >>> import lz4
-    >>> compressed_data = lz4.dumps(data)
+    >>> compressed_data = lz4.dumps(data) # Contains a 4-byte header
     >>> data == lz4.loads(compressed_data)
     True
     >>>
+    >>> compressed_data = lz4.dumps(data, head_type = 0) # The compressed package does not contain the original size
+    >>> data == lz4.loads(compressed_data, haed_type = 0) # Unpack the package without the header
+    True
 
 Methods and Constants
 =====================
@@ -39,7 +42,7 @@ The bindings provides some aliases too::
     >>> lz4.VERSION == lz4.__version__  # e.g. "0.7.0"
     True
     >>>
-
+    
 Is it fast ?
 ============
 Yes. Here are the results on my 2011 Macbook Pro i7 with lz4.c as input data: ::
